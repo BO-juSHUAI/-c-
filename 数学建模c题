@@ -1,0 +1,886 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import warnings
+
+# --- 配置 ---
+# --- 配置 ---
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
+import warnings
+
+# --- 自动设置中文字体 ---
+def set_chinese_font():
+    """
+    自动查找并设置系统中的中文字体，以解决matplotlib绘图中的中文显示问题。
+    """
+    try:
+        # 常见中文字体名称列表
+        font_names = ['SimHei', 'Heiti TC', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Micro Hei']
+        
+        # 获取matplotlib字体列表
+        font_list = fm.fontManager.ttflist
+        
+        # 查找可用字体
+        available_font = None
+        for font in font_list:
+            if font.name in font_names:
+                available_font = font.name
+                break
+        
+        if available_font:
+            print(f"找到并设置中文字体: {available_font}")
+            plt.rcParams['font.sans-serif'] = [available_font]
+        else:
+            print("警告：未找到推荐的中文字体。图形中的中文可能无法正常显示。")
+            print("请尝试安装 'SimHei', 'Microsoft YaHei' 或 'WenQuanYi Micro Hei' 字体。")
+            # 在没有找到字体的情况下，尝试一个通用设置，尽管可能无效
+            plt.rcParams['font.sans-serif'] = ['sans-serif']
+            
+    except Exception as e:
+        print(f"设置中文字体时出错: {e}")
+
+# 执行设置
+set_chinese_font()
+plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+warnings.filterwarnings('ignore')
+
+# --- 1. 数据加载与预处理 ---
+
+# Excel 文件路径（用原始字符串 r"" 避免转义错误）
+file_path = r"C题\附件.xlsx"
+
+try:
+    # 假设 Excel 里有一个工作表存放男胎检测数据，名字可能是“男胎检测数据”
+    df_male = pd.read_excel(file_path, sheet_name="男胎检测数据")
+except FileNotFoundError:
+    print("错误：请确保附件.xlsx 文件在指定目录下。")
+    exit()
+except ValueError:
+    print("错误：请确认 Excel 文件中是否存在名为 '男胎检测数据' 的工作表。")
+    exit()
+
+# --- 数据清洗与格式转换 ---
+# a. 将 'w+d' 格式的孕周转换为小数形式
+def parse_gestational_week(gw_str):
+    try:
+        w, d = map(int, gw_str.replace('w', '').replace('+', ' ').split())
+        return w + d / 7.0
+    except:
+        return np.nan  # 如果格式不正确，返回空值
+
+df_male['孕周_小数'] = df_male['检测孕周'].apply(parse_gestational_week)
+
+# b. 筛选出建模需要的核心列并处理缺失值
+core_columns = ['孕妇BMI', 'Y染色体浓度', '孕周_小数']
+df_male_clean = df_male[core_columns].dropna()
+
+# c. 创建成功与否的标签 (Y染色体浓度 >= 4%)
+Y_CONC_THRESHOLD = 0.04
+df_male_clean['is_success'] = (df_male_clean['Y染色体浓度'] >= Y_CONC_THRESHOLD).astype(int)
+
+print("数据加载与预处理完成。")
+print(f"处理后的有效样本数: {len(df_male_clean)}")
+print(df_male_clean.head())
+
+
+
+
+
+
+# --- 2. 使用K-Means对BMI进行数据驱动分组 ---
+
+# 提取BMI数据用于聚类
+bmi_data = df_male_clean[['孕妇BMI']]
+
+# a. 使用肘部法则确定最佳聚类数K
+sse = {}
+for k in range(2, 9): # 通常分组不会太多，测试2到8组
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10).fit(bmi_data)
+    sse[k] = kmeans.inertia_
+
+# 绘制肘部法则图
+plt.figure(figsize=(10, 6))
+plt.plot(list(sse.keys()), list(sse.values()), 'o-')
+plt.xlabel('聚类数量 (K)')
+plt.ylabel('簇内平方和 (SSE)')
+plt.title('K-Means 肘部法则确定最佳K值')
+plt.grid(True)
+plt.show()
+
+# b. 根据肘部法则选择K值并进行聚类
+# 从图中我们可以观察到，K=3或K=4是一个比较好的拐点。这里我们选择K=3作为示例。
+OPTIMAL_K = 4
+kmeans = KMeans(n_clusters=OPTIMAL_K, random_state=42, n_init=10)
+df_male_clean['BMI_Group'] = kmeans.fit_predict(bmi_data)
+
+# c. 分析并可视化分组结果
+print(f"\n已将孕妇按BMI分为 {OPTIMAL_K} 组。各组特征如下：")
+group_summary = df_male_clean.groupby('BMI_Group')['孕妇BMI'].describe()
+print(group_summary)
+
+
+# 绘制BMI分组的可视化图
+plt.figure(figsize=(12, 7))
+sns.histplot(data=df_male_clean, x='孕妇BMI', hue='BMI_Group', palette='viridis', multiple='stack', bins=30)
+plt.title('孕妇BMI分布与K-Means聚类分组结果')
+plt.xlabel('孕妇BMI')
+plt.ylabel('人数')
+plt.legend(title='BMI分组', labels=[f'分组 {i}' for i in range(OPTIMAL_K)])
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.show()
+
+
+
+
+
+
+# --- 3. 为每个分组构建风险模型并求解 ---
+
+# 定义孕周区间
+T_range = np.arange(10.0, 25.1, 0.1) # 从10周到25周，精度为0.1周
+
+# 定义风险函数
+# a. 生物学风险 (随时间指数增长)
+LAMBDA = 0.5 # 风险增长系数, 可调整
+T_MIN = 10   # 允许检测的最早孕周
+R_bio = np.exp(LAMBDA * (T_range - T_MIN))
+R_bio_normalized = (R_bio - R_bio.min()) / (R_bio.max() - R_bio.min()) # 归一化便于绘图
+
+# 创建一个画布，用于绘制所有分组的风险曲线
+fig, axes = plt.subplots(OPTIMAL_K, 1, figsize=(12, 8 * OPTIMAL_K), sharex=True)
+if OPTIMAL_K == 1: axes = [axes] # 保证axes可迭代
+
+for group_id in sorted(df_male_clean['BMI_Group'].unique()):
+    ax = axes[group_id]
+    group_data = df_male_clean[df_male_clean['BMI_Group'] == group_id]
+    
+    # b. 技术性风险 (基于Logistic回归)
+    X = group_data[['孕周_小数']]
+    y = group_data['is_success']
+    
+    # 训练Logistic模型来预测成功概率 P_success(T)
+    log_reg = LogisticRegression(random_state=42)
+    log_reg.fit(X, y)
+    
+    # 预测整个孕周范围内的成功概率
+    p_success = log_reg.predict_proba(T_range.reshape(-1, 1))[:, 1]
+    
+    # 技术风险 = 1 - 成功概率
+    R_tech = 1 - p_success
+    R_tech_normalized = (R_tech - R_tech.min()) / (R_tech.max() - R_tech.min()) # 归一化
+    
+    # c. 总风险 = 生物学风险 + 技术性风险 (这里使用归一化后的风险相加)
+    R_total = R_bio_normalized + R_tech_normalized
+    
+    # d. 求解最佳时点
+    optimal_idx = np.argmin(R_total)
+    optimal_T = T_range[optimal_idx]
+    min_risk = R_total[optimal_idx]
+    
+    # --- 4. 结果可视化 ---
+    
+    # 获取该组的BMI范围
+    bmi_min = group_summary.loc[group_id, 'min']
+    bmi_max = group_summary.loc[group_id, 'max']
+    bmi_mean = group_summary.loc[group_id, 'mean']
+    
+    ax.plot(T_range, R_bio_normalized, label='生物学风险 (归一化)', color='red', linestyle='--')
+    ax.plot(T_range, R_tech_normalized, label='技术性风险 (归一化)', color='blue', linestyle='--')
+    ax.plot(T_range, R_total, label='总风险', color='black', linewidth=2.5)
+    
+    # 标记最佳时点
+    ax.axvline(x=optimal_T, color='green', linestyle=':', label=f'最佳时点: {optimal_T:.1f} 周')
+    ax.plot(optimal_T, min_risk, 'go', markersize=10)
+    
+    ax.set_title(f'分组 {group_id} (BMI ≈ {bmi_min:.1f}-{bmi_max:.1f}, 均值: {bmi_mean:.1f}) 的风险曲线与最佳NIPT时点')
+    ax.set_ylabel('风险指数')
+    ax.grid(True)
+    ax.legend()
+
+plt.xlabel('检测孕周 (周)')
+plt.suptitle('各BMI分组的最佳NIPT时点分析', fontsize=20, y=0.92)
+plt.show()
+
+print("\n--- 结论：各分组的最佳NIPT时点 ---")
+# 循环打印最终结果
+for group_id in sorted(df_male_clean['BMI_Group'].unique()):
+    bmi_mean = group_summary.loc[group_id, 'mean']
+    # 重新计算一次，确保结果一致
+    group_data = df_male_clean[df_male_clean['BMI_Group'] == group_id]
+    log_reg = LogisticRegression(random_state=42).fit(group_data[['孕周_小数']], group_data['is_success'])
+    p_success = log_reg.predict_proba(T_range.reshape(-1, 1))[:, 1]
+    R_tech = 1 - p_success
+    R_total = ((R_bio - R_bio.min()) / (R_bio.max() - R_bio.min())) + ((R_tech - R_tech.min()) / (R_tech.max() - R_tech.min()))
+    optimal_T = T_range[np.argmin(R_total)]
+    print(f"分组 {group_id} (平均BMI: {bmi_mean:.2f}): 最佳NIPT时点为 {optimal_T:.1f} 周。")
+
+# --- 5. Análise de Erro (Bootstrapping para Intervalos de Confiança) ---
+
+print("\n--- 5. Iniciando Análise de Erro por Bootstrapping ---")
+print("Isso pode levar alguns minutos...")
+
+# Número de iterações do bootstrap
+N_BOOTSTRAPS = 500
+# Lista para armazenar os resultados dos momentos ótimos de cada iteração
+bootstrap_results = {group_id: [] for group_id in sorted(df_male_clean['BMI_Group'].unique())}
+
+for i in range(N_BOOTSTRAPS):
+    # Imprimir progresso
+    if (i + 1) % 50 == 0:
+        print(f"  Completada iteração {i + 1}/{N_BOOTSTRAPS}...")
+
+    for group_id in sorted(df_male_clean['BMI_Group'].unique()):
+        group_data = df_male_clean[df_male_clean['BMI_Group'] == group_id]
+        
+        # a. Reamostrar os dados do grupo com reposição
+        # O tamanho da reamostra é igual ao tamanho original do grupo
+        resampled_data = group_data.sample(n=len(group_data), replace=True, random_state=i)
+        
+        # Ignorar reamostras onde todos os resultados são iguais (ex: todos sucessos ou todos fracassos)
+        if len(resampled_data['is_success'].unique()) < 2:
+            continue
+            
+        # b. Treinar um novo modelo de regressão logística na amostra reamostrada
+        X_resampled = resampled_data[['孕周_小数']]
+        y_resampled = resampled_data['is_success']
+        
+        log_reg_boot = LogisticRegression(random_state=42)
+        log_reg_boot.fit(X_resampled, y_resampled)
+        
+        # c. Calcular a curva de risco e encontrar o momento ótimo para esta iteração
+        p_success_boot = log_reg_boot.predict_proba(T_range.reshape(-1, 1))[:, 1]
+        R_tech_boot = 1 - p_success_boot
+        R_tech_boot_normalized = (R_tech_boot - R_tech_boot.min()) / (R_tech_boot.max() - R_tech_boot.min())
+        
+        R_total_boot = R_bio_normalized + R_tech_boot_normalized
+        
+        optimal_T_boot = T_range[np.argmin(R_total_boot)]
+        
+        # d. Armazenar o resultado
+        bootstrap_results[group_id].append(optimal_T_boot)
+
+print("Análise de Bootstrapping concluída.")
+
+# --- 6. Apresentação dos Resultados da Análise de Erro ---
+
+print("\n--- Conclusão Final com Intervalos de Confiança de 95% ---")
+for group_id in sorted(df_male_clean['BMI_Group'].unique()):
+    # Re-calcula o ponto ótimo original para referência
+    group_data = df_male_clean[df_male_clean['BMI_Group'] == group_id]
+    log_reg = LogisticRegression(random_state=42).fit(group_data[['孕周_小数']], group_data['is_success'])
+    p_success = log_reg.predict_proba(T_range.reshape(-1, 1))[:, 1]
+    R_tech = 1 - p_success
+    R_total = ((R_bio - R_bio.min()) / (R_bio.max() - R_bio.min())) + ((R_tech - R_tech.min()) / (R_tech.max() - R_tech.min()))
+    optimal_T_original = T_range[np.argmin(R_total)]
+
+    # Calcula o intervalo de confiança a partir dos resultados do bootstrap
+    optimal_times = bootstrap_results[group_id]
+    if optimal_times:
+        conf_interval_lower = np.percentile(optimal_times, 2.5)
+        conf_interval_upper = np.percentile(optimal_times, 97.5)
+        mean_optimal_T = np.mean(optimal_times)
+        
+        bmi_mean = group_summary.loc[group_id, 'mean']
+        
+        print(f"Grupo {group_id} (BMI Médio: {bmi_mean:.2f}):")
+        print(f"  - Momento Ótimo Estimado: {optimal_T_original:.1f} semanas")
+        print(f"  - Intervalo de Confiança de 95% (via Bootstrap): [{conf_interval_lower:.1f}, {conf_interval_upper:.1f}] semanas")
+    else:
+        print(f"Grupo {group_id}: Não foi possível calcular o intervalo de confiança (dados insuficientes na reamostragem).")
+
+# Visualização da distribuição dos momentos ótimos
+fig_boot, axes_boot = plt.subplots(OPTIMAL_K, 1, figsize=(12, 3 * OPTIMAL_K), sharex=True)
+if OPTIMAL_K == 1: axes_boot = [axes_boot]
+
+for group_id in sorted(df_male_clean['BMI_Group'].unique()):
+    ax = axes_boot[group_id]
+    sns.histplot(bootstrap_results[group_id], ax=ax, bins=20, kde=True)
+    
+    conf_interval_lower = np.percentile(bootstrap_results[group_id], 2.5)
+    conf_interval_upper = np.percentile(bootstrap_results[group_id], 97.5)
+    
+    ax.axvline(conf_interval_lower, color='red', linestyle='--', label=f'Limite Inferior (95% CI): {conf_interval_lower:.1f}')
+    ax.axvline(conf_interval_upper, color='red', linestyle='--', label=f'Limite Superior (95% CI): {conf_interval_upper:.1f}')
+    
+    bmi_mean = group_summary.loc[group_id, 'mean']
+    ax.set_title(f'Distribuição Bootstrap do Momento Ótimo para o Grupo {group_id} (BMI Médio: {bmi_mean:.1f})')
+    ax.set_xlabel('Momento Ótimo de NIPT (Semanas)')
+    ax.set_ylabel('Frequência')
+    ax.legend()
+    
+plt.tight_layout()
+plt.show()
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import warnings
+
+# --- 配置 ---
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
+import warnings
+
+# --- 自动设置中文字体 ---
+def set_chinese_font():
+    """
+    自动查找并设置系统中的中文字体，以解决matplotlib绘图中的中文显示问题。
+    """
+    try:
+        # 常见中文字体名称列表
+        font_names = ['SimHei', 'Heiti TC', 'Microsoft YaHei', 'PingFang SC', 'WenQuanYi Micro Hei']
+        
+        # 获取matplotlib字体列表
+        font_list = fm.fontManager.ttflist
+        
+        # 查找可用字体
+        available_font = None
+        for font in font_list:
+            if font.name in font_names:
+                available_font = font.name
+                break
+        
+        if available_font:
+            print(f"找到并设置中文字体: {available_font}")
+            plt.rcParams['font.sans-serif'] = [available_font]
+        else:
+            print("警告：未找到推荐的中文字体。图形中的中文可能无法正常显示。")
+            print("请尝试安装 'SimHei', 'Microsoft YaHei' 或 'WenQuanYi Micro Hei' 字体。")
+            # 在没有找到字体的情况下，尝试一个通用设置，尽管可能无效
+            plt.rcParams['font.sans-serif'] = ['sans-serif']
+            
+    except Exception as e:
+        print(f"设置中文字体时出错: {e}")
+
+# 执行设置
+set_chinese_font()
+plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+warnings.filterwarnings('ignore')
+# --- 1. 数据加载与预处理 ---
+
+# Excel 文件路径（请确保路径正确）
+file_path = r"C题\附件.xlsx"
+
+try:
+    df_male = pd.read_excel(file_path, sheet_name="男胎检测数据")
+except FileNotFoundError:
+    print("错误：请确保附件.xlsx 文件在指定目录下。")
+    exit()
+except ValueError:
+    print("错误：请确认 Excel 文件中是否存在名为 '男胎检测数据' 的工作表。")
+    exit()
+
+# 数据清洗与格式转换
+def parse_gestational_week(gw_str):
+    try:
+        w, d = map(int, gw_str.replace('w', '').replace('+', ' ').split())
+        return w + d / 7.0
+    except:
+        return np.nan
+
+df_male['孕周_小数'] = df_male['检测孕周'].apply(parse_gestational_week)
+
+# 新增核心列：年龄, 身高, 体重
+core_columns = ['孕妇BMI', '年龄', '身高', '体重', 'Y染色体浓度', '孕周_小数']
+df_male_clean = df_male[core_columns].dropna()
+
+# 创建成功与否的标签 (Y染色体浓度 >= 4%)
+Y_CONC_THRESHOLD = 0.04
+df_male_clean['is_success'] = (df_male_clean['Y染色体浓度'] >= Y_CONC_THRESHOLD).astype(int)
+
+print("数据加载与预处理完成。")
+print(f"处理后的有效样本数: {len(df_male_clean)}")
+print(df_male_clean.head())
+
+# --- 2. 多维聚类分组 ---
+
+# 提取用于聚类的数据（BMI, 年龄, 身高, 体重）
+clustering_data = df_male_clean[['孕妇BMI', '年龄', '身高', '体重']]
+
+# 对数据进行标准化，以确保各个特征的权重均衡
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(clustering_data)
+
+# 使用肘部法则确定最佳聚类数K
+sse = {}
+for k in range(2, 9):
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10).fit(scaled_data)
+    sse[k] = kmeans.inertia_
+
+# 绘制肘部法则图
+plt.figure(figsize=(10, 6))
+plt.plot(list(sse.keys()), list(sse.values()), 'o-')
+plt.xlabel('聚类数量 (K)')
+plt.ylabel('簇内平方和 (SSE)')
+plt.title('K-Means 肘部法则确定最佳K值（多维）')
+plt.grid(True)
+plt.show()
+
+# 根据肘部法则选择K值（这里仍然选择K=4作为示例）
+OPTIMAL_K = 4
+kmeans = KMeans(n_clusters=OPTIMAL_K, random_state=42, n_init=10)
+df_male_clean['Multi_Factor_Group'] = kmeans.fit_predict(scaled_data)
+
+# 分析并可视化分组结果
+print(f"\n已将孕妇按多因素分为 {OPTIMAL_K} 组。各组特征如下：")
+multi_group_summary = df_male_clean.groupby('Multi_Factor_Group')[['孕妇BMI', '年龄', '身高', '体重']].describe()
+print(multi_group_summary)
+
+# 可视化分组（以BMI vs 年龄为例）
+plt.figure(figsize=(12, 8))
+# 关键修改：更换调色板为更具视觉冲击力的 'bright'，并增大点的大小
+sns.scatterplot(data=df_male_clean, x='孕妇BMI', y='年龄', hue='Multi_Factor_Group', palette='bright', s=100, alpha=0.8)
+plt.title('多因素聚类分组可视化 (BMI vs 年龄)')
+plt.xlabel('孕妇BMI')
+plt.ylabel('孕妇年龄')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.show()
+
+# --- 3. 为每个分组构建风险模型并求解 ---
+
+# 定义孕周区间
+T_range = np.arange(10.0, 25.1, 0.1)
+T_MIN = 10
+# LAMBDA系数可以根据问题二的敏感性分析结果来选择，这里使用0.5作为示例
+LAMBDA = 0.5 
+
+# 定义风险函数
+# 生物学风险 (随时间指数增长)
+R_bio = np.exp(LAMBDA * (T_range - T_MIN))
+R_bio_normalized = (R_bio - R_bio.min()) / (R_bio.max() - R_bio.min())
+
+# 创建一个画布，用于绘制所有分组的风险曲线
+fig, axes = plt.subplots(OPTIMAL_K, 1, figsize=(12, 6 * OPTIMAL_K), sharex=True)
+if OPTIMAL_K == 1: axes = [axes] # 保证axes可迭代
+
+for group_id in sorted(df_male_clean['Multi_Factor_Group'].unique()):
+    ax = axes[group_id]
+    group_data = df_male_clean[df_male_clean['Multi_Factor_Group'] == group_id]
+    
+    if len(group_data) < 2:
+        print(f"警告：分组 {group_id} 样本数过少，跳过计算。")
+        continue
+
+    # 训练逻辑回归模型来预测达标概率
+    X = group_data[['孕周_小数']]
+    y = group_data['is_success']
+    log_reg = LogisticRegression(random_state=42)
+    log_reg.fit(X, y)
+
+    # 计算达标比例（这里使用群体平均达标概率来近似）
+    # 在每个孕周T下，预测该分组中每个个体的达标概率，并求均值
+    compliance_rates = []
+    for t in T_range:
+        # 创建一个虚拟的DataFrame来预测，包含所有个体的特征（除孕周外）
+        # 简化处理：由于我们已经将逻辑回归模型训练在孕周上，这里直接用t来预测
+        # 这也符合问题三中将达标比例视为P(T, Mj)的函数
+        
+        # 预测该孕周下的达标概率
+        prob_success = log_reg.predict_proba(np.array(t).reshape(-1, 1))[:, 1]
+        compliance_rates.append(prob_success[0])
+
+    R_tech = 1 - np.array(compliance_rates)
+    R_tech_normalized = (R_tech - R_tech.min()) / (R_tech.max() - R_tech.min())
+    
+    # 总风险 = 生物学风险 + 技术性风险 (归一化相加)
+    R_total = R_bio_normalized + R_tech_normalized
+    
+    # 求解最佳时点
+    optimal_idx = np.argmin(R_total)
+    optimal_T = T_range[optimal_idx]
+    min_risk = R_total[optimal_idx]
+    
+    # --- 4. 结果可视化 ---
+    ax.plot(T_range, R_bio_normalized, label='生物学风险 (归一化)', color='red', linestyle='--')
+    ax.plot(T_range, R_tech_normalized, label='技术性风险 (归一化)', color='blue', linestyle='--')
+    ax.plot(T_range, R_total, label='总风险', color='black', linewidth=2.5)
+    
+    # 标记最佳时点
+    ax.axvline(x=optimal_T, color='green', linestyle=':', label=f'最佳时点: {optimal_T:.1f} 周')
+    ax.plot(optimal_T, min_risk, 'go', markersize=10)
+    
+    group_info = multi_group_summary.loc[group_id]
+    ax.set_title(f'分组 {group_id} 的风险曲线 (BMI均值: {group_info["孕妇BMI"]["mean"]:.1f}, 年龄均值: {group_info["年龄"]["mean"]:.1f})')
+    ax.set_ylabel('风险指数')
+    ax.grid(True)
+    ax.legend()
+
+plt.xlabel('检测孕周 (周)')
+plt.suptitle('多因素分组下的最佳NIPT时点分析', fontsize=20, y=0.92)
+plt.show()
+
+print("\n--- 结论：各多因素分组的最佳NIPT时点 ---")
+for group_id in sorted(df_male_clean['Multi_Factor_Group'].unique()):
+    group_data = df_male_clean[df_male_clean['Multi_Factor_Group'] == group_id]
+    if len(group_data) < 2:
+        continue
+    
+    log_reg = LogisticRegression(random_state=42).fit(group_data[['孕周_小数']], group_data['is_success'])
+    compliance_rates = log_reg.predict_proba(T_range.reshape(-1, 1))[:, 1]
+    
+    R_tech = 1 - compliance_rates
+    R_total = R_bio_normalized + ((R_tech - R_tech.min()) / (R_tech.max() - R_tech.min()))
+    optimal_T = T_range[np.argmin(R_total)]
+    
+    group_info = multi_group_summary.loc[group_id]
+    print(f"分组 {group_id} (BMI均值: {group_info['孕妇BMI']['mean']:.2f}, 年龄均值: {group_info['年龄']['mean']:.1f}): 最佳NIPT时点为 {optimal_T:.1f} 周。")
+
+# --- 5. Análise de Erro (Bootstrapping para Grupos Multifatoriais) ---
+
+print("\n--- 5. Iniciando Análise de Erro por Bootstrapping (Multifatorial) ---")
+print("Este processo pode levar alguns minutos...")
+
+# Número de iterações do bootstrap
+N_BOOTSTRAPS = 500
+# Dicionário para armazenar os resultados dos momentos ótimos de cada iteração
+bootstrap_results_multi = {group_id: [] for group_id in sorted(df_male_clean['Multi_Factor_Group'].unique())}
+
+for i in range(N_BOOTSTRAPS):
+    # Imprimir progresso
+    if (i + 1) % 50 == 0:
+        print(f"  Completada iteração {i + 1}/{N_BOOTSTRAPS}...")
+
+    for group_id in sorted(df_male_clean['Multi_Factor_Group'].unique()):
+        group_data = df_male_clean[df_male_clean['Multi_Factor_Group'] == group_id]
+        
+        # 如果分组的样本数过少，跳过此分组
+        if len(group_data) < 10:
+            continue
+
+        # a. Reamostrar los datos del grupo com reposição
+        resampled_data = group_data.sample(n=len(group_data), replace=True, random_state=i)
+        
+        # Ignorar reamostras onde todos os resultados são iguais
+        if len(resampled_data['is_success'].unique()) < 2:
+            continue
+            
+        # b. Treinar um novo modelo de regressão logística na amostra reamostrada
+        X_resampled = resampled_data[['孕周_小数']]
+        y_resampled = resampled_data['is_success']
+        
+        log_reg_boot = LogisticRegression(random_state=42)
+        log_reg_boot.fit(X_resampled, y_resampled)
+        
+        # c. Calcular a curva de risco e encontrar o momento ótimo para esta iteração
+        p_success_boot = log_reg_boot.predict_proba(T_range.reshape(-1, 1))[:, 1]
+        R_tech_boot = 1 - p_success_boot
+        R_tech_boot_normalized = (R_tech_boot - R_tech_boot.min()) / (R_tech_boot.max() - R_tech_boot.min())
+        
+        R_total_boot = R_bio_normalized + R_tech_boot_normalized
+        
+        optimal_T_boot = T_range[np.argmin(R_total_boot)]
+        
+        # d. Armazenar o resultado
+        bootstrap_results_multi[group_id].append(optimal_T_boot)
+
+print("Análise de Bootstrapping concluída.")
+
+# --- 6. Apresentação dos Resultados da Análise de Erro ---
+
+print("\n--- Conclusão Final (Multifatorial) com Intervalos de Confiança de 95% ---")
+for group_id in sorted(df_male_clean['Multi_Factor_Group'].unique()):
+    # Recalcula o ponto ótimo original para referência
+    group_data = df_male_clean[df_male_clean['Multi_Factor_Group'] == group_id]
+    if len(group_data) < 2:
+        continue
+    
+    log_reg = LogisticRegression(random_state=42).fit(group_data[['孕周_小数']], group_data['is_success'])
+    compliance_rates = log_reg.predict_proba(T_range.reshape(-1, 1))[:, 1]
+    R_tech = 1 - compliance_rates
+    R_total = R_bio_normalized + ((R_tech - R_tech.min()) / (R_tech.max() - R_tech.min()))
+    optimal_T_original = T_range[np.argmin(R_total)]
+
+    # Calcula o intervalo de confiança a partir dos resultados do bootstrap
+    optimal_times = bootstrap_results_multi[group_id]
+    group_info = multi_group_summary.loc[group_id]
+    
+    print(f"Grupo {group_id} (BMI Médio: {group_info['孕妇BMI']['mean']:.2f}, Idade Média: {group_info['年龄']['mean']:.1f}):")
+    print(f"  - Momento Ótimo Estimado: {optimal_T_original:.1f} semanas")
+    
+    if optimal_times:
+        conf_interval_lower = np.percentile(optimal_times, 2.5)
+        conf_interval_upper = np.percentile(optimal_times, 97.5)
+        print(f"  - Intervalo de Confiança de 95% (via Bootstrap): [{conf_interval_lower:.1f}, {conf_interval_upper:.1f}] semanas")
+    else:
+        print("  - Não foi possível calcular o intervalo de confiança (dados insuficientes no grupo).")
+
+# Visualização da distribuição dos momentos ótimos
+fig_boot, axes_boot = plt.subplots(OPTIMAL_K, 1, figsize=(12, 4 * OPTIMAL_K), sharex=True)
+if OPTIMAL_K == 1: axes_boot = [axes_boot]
+
+for group_id in sorted(bootstrap_results_multi.keys()):
+    if not bootstrap_results_multi[group_id]: continue # Pula grupos vazios
+    
+    ax = axes_boot[group_id]
+    sns.histplot(bootstrap_results_multi[group_id], ax=ax, bins=20, kde=True)
+    
+    conf_interval_lower = np.percentile(bootstrap_results_multi[group_id], 2.5)
+    conf_interval_upper = np.percentile(bootstrap_results_multi[group_id], 97.5)
+    
+    ax.axvline(conf_interval_lower, color='red', linestyle='--', label=f'Limite Inferior (95% CI): {conf_interval_lower:.1f}')
+    ax.axvline(conf_interval_upper, color='red', linestyle='--', label=f'Limite Superior (95% CI): {conf_interval_upper:.1f}')
+    
+    group_info = multi_group_summary.loc[group_id]
+    ax.set_title(f'Distribuição Bootstrap do Momento Ótimo para o Grupo {group_id} (BMI Médio: {group_info["孕妇BMI"]["mean"]:.1f})')
+    ax.set_xlabel('Momento Ótimo de NIPT (Semanas)')
+    ax.set_ylabel('Frequência')
+    ax.legend()
+    
+plt.tight_layout()
+plt.show()
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, roc_curve, auc
+import warnings
+
+# 忽略所有警告，以获得更清晰的输出
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.family'] = 'SimHei'  # 使用SimHei字体，这是一个常见的中文支持字体
+plt.rcParams['axes.unicode_minus'] = False  # 解决保存图像时负号'-'显示为方块的问题
+
+# 1. 加载数据
+# 使用您提供的文件路径，并将其作为原始字符串处理
+file_path = r"C题\附件.xlsx"
+
+try:
+    # 明确指定要读取的工作表名称
+    df = pd.read_excel(file_path, sheet_name='女胎检测数据')
+except FileNotFoundError:
+    print(f"错误：文件 '{file_path}' 未找到。请检查您的文件路径是否正确。")
+    exit()
+except ValueError:
+    print("错误：无法找到名为 '女胎检测数据' 的工作表。请检查附件.xlsx中的工作表名称。")
+    # 如果找不到，可以打印所有工作表名以供用户检查
+    xls = pd.ExcelFile(file_path)
+    print("可用的工作表名称有：", xls.sheet_names)
+    exit()
+
+# 2. 数据预处理
+# 将目标变量转换为二元标签
+# 确认目标列名：“染色体的非整倍体,即数量异常,空白即为无异常”
+target_column = '染色体的非整倍体'
+female_df = df.copy()
+female_df['is_abnormal'] = female_df[target_column].apply(lambda x: 0 if pd.isna(x) else 1)
+y = female_df['is_abnormal']
+
+# 选择特征列，直接使用中文列名
+features = [
+    '13号染色体的Z值',
+    '18号染色体的Z值',
+    '21号染色体的Z值',
+    'X染色体的Z值',
+    '13号染色体的GC含量',
+    '18号染色体的GC含量',
+    '21号染色体的GC含量',
+    '原始读段数',
+    '在参考基因组上比对的比例',
+    '重复读段的比例',
+    '被过滤掉读段数的比例',
+    '孕妇BMI'
+]
+
+X = female_df[features].copy()
+
+# 处理特征中的缺失值
+for col in X.columns:
+    if X[col].dtype == 'object':
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+    X[col] = X[col].fillna(X[col].median())
+
+# 3. 特征可视化
+# 相关性热力图
+plt.figure(figsize=(12, 10))
+# 恢复为 'coolwarm' 颜色方案
+sns.heatmap(X.corr(), annot=True, cmap='coolwarm', fmt=".2f")
+plt.title('特征相关性热力图')
+plt.show()
+
+# 对比正常和异常胎儿的特征分布
+plt.figure(figsize=(15, 10))
+for i, col in enumerate(features[:4]): # 只展示前4个特征
+    plt.subplot(2, 2, i + 1)
+    # 更改调色板为 'Paired'
+    sns.histplot(female_df, x=col, hue='is_abnormal', kde=True, palette='Paired')
+    plt.title(f'{col} 的分布')
+plt.tight_layout()
+plt.show()
+
+# 4. 数据标准化
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 5. 主成分分析 (PCA)
+pca = PCA().fit(X_scaled)
+plt.figure(figsize=(8, 6))
+plt.plot(np.cumsum(pca.explained_variance_ratio_))
+plt.xlabel('主成分数量')
+plt.ylabel('累积解释方差')
+plt.title('PCA累积解释方差')
+plt.grid(True)
+plt.show()
+
+# 选择主成分数量
+n_components = np.where(np.cumsum(pca.explained_variance_ratio_) > 0.95)[0][0] + 1
+print(f'解释超过95%方差所需的主成分数量: {n_components}')
+
+pca = PCA(n_components=n_components)
+X_pca = pca.fit_transform(X_scaled)
+
+# 6. 构建和训练 Logistic Regression 模型
+X_train, X_test, y_train, y_test = train_test_split(X_pca, y, test_size=0.3, random_state=42, stratify=y)
+log_reg_model = LogisticRegression(random_state=42)
+log_reg_model.fit(X_train, y_train)
+
+# 7. 模型评估
+y_pred = log_reg_model.predict(X_test)
+y_prob = log_reg_model.predict_proba(X_test)[:, 1]
+
+# 混淆矩阵
+print("混淆矩阵:")
+print(confusion_matrix(y_test, y_pred))
+
+# 分类报告
+print("\n分类报告:")
+print(classification_report(y_test, y_pred))
+
+# ROC曲线和AUC值
+fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+roc_auc = auc(fpr, tpr)
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC曲线 (面积 = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('假正率')
+plt.ylabel('真正率')
+plt.title('受试者工作特征曲线 (ROC)')
+plt.legend(loc="lower right")
+plt.show()
+
+print(f"\n模型准确度: {accuracy_score(y_test, y_pred):.4f}")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# 设置中文和负号显示
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+### 第一步：数据加载和预处理 (与之前代码相同)
+try:
+    file_path = r"C题\附件.xlsx"
+    df_male = pd.read_excel(file_path, sheet_name='男胎检测数据')
+    print("数据加载成功！")
+except FileNotFoundError:
+    print(f"错误：文件未找到，请检查路径是否正确。\n尝试的路径: {file_path}")
+    exit()
+except Exception as e:
+    print(f"数据加载时发生错误：{e}")
+    exit()
+
+def convert_gestational_week(week_str):
+    try:
+        if not isinstance(week_str, str):
+            return np.nan
+        if 'w' in week_str:
+            parts = week_str.split('w+')
+            weeks = int(parts[0])
+            days = 0
+            if len(parts) > 1:
+                days = int(parts[1])
+            return weeks + days / 7
+        else:
+            return np.nan
+    except (ValueError, IndexError):
+        return np.nan
+
+df_male['检测孕周_数值'] = df_male['检测孕周'].apply(convert_gestational_week)
+df_male['Y染色体浓度'] = pd.to_numeric(df_male['Y染色体浓度'], errors='coerce')
+df_male['年龄'] = pd.to_numeric(df_male['年龄'], errors='coerce')
+df_male['身高'] = pd.to_numeric(df_male['身高'], errors='coerce')
+df_male['体重'] = pd.to_numeric(df_male['体重'], errors='coerce')
+df_male['孕妇BMI'] = pd.to_numeric(df_male['孕妇BMI'], errors='coerce')
+
+df_male.dropna(subset=['Y染色体浓度', '检测孕周_数值', '年龄', '身高', '体重', '孕妇BMI'], inplace=True)
+
+print("\n数据预处理完成。")
+
+
+
+### **第二步：优化前的诊断 - 多重共线性检查**
+
+print("\n" + "="*50)
+print("诊断：多重共线性检查 (VIF)")
+print("="*50)
+# 定义自变量，不包含截距项
+X_vif = df_male[['检测孕周_数值', '年龄', '身高', '体重', '孕妇BMI']]
+X_vif = sm.add_constant(X_vif)
+
+# 计算VIF
+vif_data = pd.DataFrame()
+vif_data["feature"] = X_vif.columns
+vif_data["VIF"] = [variance_inflation_factor(X_vif.values, i) for i in range(len(X_vif.columns))]
+print(vif_data)
+
+# 解释VIF结果：通常VIF > 5 表示存在严重共线性。
+print("\n诊断结果：身高、体重和孕妇BMI的VIF值非常高，存在严重的多重共线性。")
+print("这可能是导致之前模型中变量不显著的原因。")
+
+
+
+### **第三步：构建并训练优化模型**
+
+print("\n" + "="*50)
+print("优化模型一：去除共线性变量")
+print("="*50)
+# 只保留BMI，去除身高和体重，以消除共线性影响
+X_optimized_1 = df_male[['检测孕周_数值', '年龄', '孕妇BMI']]
+y = df_male['Y染色体浓度']
+X_optimized_1 = sm.add_constant(X_optimized_1)
+
+model_optimized_1 = sm.OLS(y, X_optimized_1).fit()
+print(model_optimized_1.summary())
+
+# 解读：检查优化后模型中 '孕妇BMI' 的 P值。如果它现在显著了，说明多重共线性是之前不显著的原因。
+
+print("\n" + "="*50)
+print("优化模型二：添加交互项")
+print("="*50)
+# 创建新的交互项：孕周_数值 * 孕妇BMI
+df_male['孕周_BMI_交互项'] = df_male['检测孕周_数值'] * df_male['孕妇BMI']
+
+# 构建包含交互项的模型
+X_optimized_2 = df_male[['检测孕周_数值', '年龄', '孕妇BMI', '孕周_BMI_交互项']]
+X_optimized_2 = sm.add_constant(X_optimized_2)
+
+model_optimized_2 = sm.OLS(y, X_optimized_2).fit()
+print(model_optimized_2.summary())
+
+# 解读：检查优化后模型中 '孕妇BMI' 和 '孕周_BMI_交互项' 的 P值。
+# 如果交互项显著，则表明BMI的影响确实存在，但它依赖于孕周这个变量。
+
+print("\n" + "="*50)
+print("              优化模型结果分析")
+print("="*50)
+print("请重点关注两个优化模型中 '孕妇BMI' 及其交互项的 P值。")
+print("如果P值小于0.05，则表明其影响是显著的。")
+print("这种方法不仅解决了您的问题，也符合严谨的统计学原则，可以作为您论文中重要的分析亮点。")
